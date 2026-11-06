@@ -30,8 +30,20 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const CONFIG_PATH = path.join(__dirname, '..', 'config', 'users.json');
 const SOUNDS_DIR = path.join(__dirname, '..', 'sounds');
 
-const JOIN_DELAY_MS = 4000; // пауза после подключения перед проигрыванием
+const DEFAULT_JOIN_DELAY_MS = 4000; // дефолтная пауза после подключения перед проигрыванием
 const COOLDOWN_MS = 60_000; // анти-спам: не чаще одного срабатывания в минуту на пользователя
+
+function parseJoinDelayMs(raw) {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_JOIN_DELAY_MS;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    console.warn(`Некорректное значение JOIN_DELAY_MS="${raw}" — использую дефолт ${DEFAULT_JOIN_DELAY_MS} мс.`);
+    return DEFAULT_JOIN_DELAY_MS;
+  }
+  return value;
+}
+
+const JOIN_DELAY_MS = parseJoinDelayMs(process.env.JOIN_DELAY_MS);
 const CONNECTION_READY_TIMEOUT_MS = 15_000;
 const PLAYBACK_TIMEOUT_MS = 60_000;
 
