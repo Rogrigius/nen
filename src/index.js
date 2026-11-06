@@ -55,6 +55,31 @@ if (!TOKEN) {
   process.exit(1);
 }
 
+// Значение в конфиге: строка (звук входа) или объект { join, leave }.
+// Приводит его к виду { join?: string, leave?: string }; null — запись непригодна.
+function normalizeUserEntry(userId, value) {
+  if (typeof value === 'string') return { join: value };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+
+  const sounds = {};
+  for (const kind of ['join', 'leave']) {
+    if (value[kind] === undefined) continue;
+    if (typeof value[kind] === 'string') {
+      sounds[kind] = value[kind];
+    } else {
+      console.warn(`Внимание: поле "${kind}" пользователя ${userId} должно быть строкой — игнорирую.`);
+    }
+  }
+  return Object.keys(sounds).length > 0 ? sounds : null;
+}
+
+function warnIfSoundMissing(userId, kind, file) {
+  const filePath = path.join(SOUNDS_DIR, file);
+  if (!filePath.startsWith(SOUNDS_DIR + path.sep) || !fs.existsSync(filePath)) {
+    console.warn(`Внимание: звуковой файл (${kind}) для пользователя ${userId} не найден: ${filePath}`);
+  }
+}
+
 function loadUserSounds() {
   let data;
   try {
@@ -65,19 +90,19 @@ function loadUserSounds() {
   }
 
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
-    console.error(`Конфиг ${CONFIG_PATH} должен быть объектом вида { "userId": "файл.mp3" }.`);
+    console.error(
+      `Конфиг ${CONFIG_PATH} должен быть объектом вида { "userId": "файл.mp3" } ` +
+        'или { "userId": { "join": "вход.mp3", "leave": "выход.mp3" } }.',
+    );
     process.exit(1);
   }
 
-  const entries = Object.entries(data).filter(
-    ([userId, file]) => typeof userId === 'string' && typeof file === 'string',
-  );
-
-  for (const [userId, file] of entries) {
-    const filePath = path.join(SOUNDS_DIR, file);
-    if (!filePath.startsWith(SOUNDS_DIR + path.sep) || !fs.existsSync(filePath)) {
-      console.warn(`Внимание: звуковой файл для пользователя ${userId} не найден: ${filePath}`);
-    }
+  const entries = [];
+  for (const [userId, value] of Object.entries(data)) {
+    const sounds = normalizeUserEntry(userId, value);
+    if (!sounds) continue;
+    for (const [kind, file] of Object.entries(sounds)) warnIfSoundMissing(userId, kind, file);
+    entries.push([userId, sounds]);
   }
 
   if (entries.length === 0) {
@@ -88,7 +113,7 @@ function loadUserSounds() {
 }
 
 const userSounds = loadUserSounds();
-const lastTriggeredAt = new Map(); // userId -> timestamp последнего срабатывания
+const lastTriggeredAt = new Map(); // "join:userId" / "leave:userId" -> timestamp последнего срабатывания
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
@@ -96,7 +121,7 @@ const client = new Client({
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function playSoundInChannel(channel, soundFile) {
+async function playSoundInChannel(channel, soundFile, delayMs) {
   const connection = joinVoiceChannel({
     channelId: channel.id,
     guildId: channel.guild.id,
@@ -106,7 +131,7 @@ async function playSoundInChannel(channel, soundFile) {
 
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, CONNECTION_READY_TIMEOUT_MS);
-    await sleep(JOIN_DELAY_MS);
+    if (delayMs > 0) await sleep(delayMs);
 
     const resource = createAudioResource(path.join(SOUNDS_DIR, soundFile));
     const player = createAudioPlayer({
@@ -124,37 +149,50 @@ async function playSoundInChannel(channel, soundFile) {
   }
 }
 
+// kind — "join" или "leave"; channel — канал, в котором нужно сыграть звук.
+async function triggerSound(kind, member, channel, soundFile, delayMs) {
+  const cooldownKey = `${kind}:${member.id}`;
+  const now = Date.now();
+  const last = lastTriggeredAt.get(cooldownKey) ?? 0;
+  if (now - last < COOLDOWN_MS) {
+    console.log(`Анти-спам: пропускаю звук (${kind}) для ${member.user.tag} — прошло меньше минуты.`);
+    return;
+  }
+
+  const existingConnection = getVoiceConnection(channel.guild.id);
+  if (existingConnection) {
+    console.log(`Бот уже подключён к голосовому каналу на сервере "${channel.guild.name}" — повторно не захожу.`);
+    return;
+  }
+
+  lastTriggeredAt.set(cooldownKey, now);
+  await playSoundInChannel(channel, soundFile, delayMs);
+}
+
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   try {
     const member = newState.member;
     if (!member || member.user.bot) return;
 
-    const joinedChannelId = newState.channelId;
-    if (!joinedChannelId) return; // пользователь вышел из канала
-    if (oldState.channelId === joinedChannelId) return; // мьют/дефен и т.п. в том же канале
+    const sounds = userSounds.get(newState.id);
+    if (!sounds) return;
+
+    if (!newState.channelId) {
+      // Полный выход из голосовых каналов: играем звук выхода в канале, который пользователь только что покинул.
+      if (!oldState.channelId || !sounds.leave) return;
+      const channel = oldState.channel;
+      if (!channel) return;
+      await triggerSound('leave', member, channel, sounds.leave, 0);
+      return;
+    }
+
+    if (oldState.channelId === newState.channelId) return; // мьют/дефен и т.п. в том же канале
 
     // Вход в канал или переход между каналами — оба считаются новым входом.
-    const soundFile = userSounds.get(newState.id);
-    if (!soundFile) return;
-
-    const now = Date.now();
-    const last = lastTriggeredAt.get(newState.id) ?? 0;
-    if (now - last < COOLDOWN_MS) {
-      console.log(`Анти-спам: пропускаю вход ${member.user.tag} — прошло меньше минуты.`);
-      return;
-    }
-
+    if (!sounds.join) return;
     const channel = newState.channel;
     if (!channel) return;
-
-    const existingConnection = getVoiceConnection(newState.guild.id);
-    if (existingConnection) {
-      console.log(`Бот уже подключён к голосовому каналу на сервере "${newState.guild.name}" — повторно не захожу.`);
-      return;
-    }
-
-    lastTriggeredAt.set(newState.id, now);
-    await playSoundInChannel(channel, soundFile);
+    await triggerSound('join', member, channel, sounds.join, JOIN_DELAY_MS);
   } catch (error) {
     console.error('Ошибка при обработке voiceStateUpdate:', error);
   }
